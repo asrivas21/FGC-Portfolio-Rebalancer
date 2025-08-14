@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 from scipy.optimize import differential_evolution
+from pathlib import Path
+
 
 # ------------------------- knobs you can tweak --------------------------
 SHORTLIST_SIZE = 20          # candidates per replaceable slot
@@ -189,6 +191,29 @@ def fill_and_audit_dv01(ext):
     return ext
 
 
+# ---- realistic universe guardrails (drop clearly broken rows) ----
+MAX_REALISTIC_YIELD = 30.0   # %; tune if needed
+MAX_REALISTIC_DUR   = 20.0   # years
+MIN_REALISTIC_DUR   = 0.0
+MIN_REALISTIC_PRICE = 20.0   # avoids penny quotes
+MAX_REALISTIC_PRICE = 200.0
+
+def sanitize_universe(ext: pd.DataFrame) -> pd.DataFrame:
+    ext = ext.copy()
+    # numeric coercion already done earlier; just filter
+    if "Yield" in ext.columns:
+        ext = ext[ext["Yield"].between(-MAX_REALISTIC_YIELD, MAX_REALISTIC_YIELD, inclusive="both")]
+    if "Duration" in ext.columns:
+        m = ext["Duration"].notna()
+        ext = ext[(~m) | (ext.loc[m, "Duration"].between(MIN_REALISTIC_DUR, MAX_REALISTIC_DUR, inclusive="both"))]
+    if "Price" in ext.columns:
+        ext = ext[ext["Price"].between(MIN_REALISTIC_PRICE, MAX_REALISTIC_PRICE, inclusive="both")]
+    # de-dupe again for safety
+    if "CUSIP" in ext.columns:
+        ext = ext.drop_duplicates(subset=["CUSIP"]).reset_index(drop=True)
+    return ext
+
+
 # ---------- 1) Load data ----------
 def load_data(csv_path):
     # Current portfolio
@@ -251,6 +276,10 @@ def load_data(csv_path):
 
     # final sanity
     ext = ext[(ext["Price"] > 0) & (ext["Yield"].notna())]
+
+    # NEW: guardrail sanitizer (drops sketchy rows deterministically)
+    ext = sanitize_universe(ext)
+
 
     print("\n[load_data] ext rows after cleaning:", len(ext))
     if len(ext) == 0:
@@ -354,7 +383,7 @@ def build_slots_and_shortlists(current, ext, selected_params, targets, tolerance
 # ---------- 4) Objective ----------
 def build_objective(kept, slots, shortlists, selected_params, targets, tolerances, min_qty, lot_size, budget_band):
     current_total_mv = mv_of(pd.concat([kept, slots], ignore_index=True)).sum()
-    budget_low = (1.0 - budget_band) * current_total_mv
+    budget_low  = (1.0 - budget_band) * current_total_mv
     budget_high = (1.0 + budget_band) * current_total_mv
 
     base_avg_rating = weighted_avg(pd.concat([kept, slots], ignore_index=True), "Quantity", "Rating_Score")
@@ -366,6 +395,63 @@ def build_objective(kept, slots, shortlists, selected_params, targets, tolerance
         layout += [("sel", j, S_j), ("q_orig", j), ("q_cand", j)]
 
     kept_block = kept[["CUSIP","Price","Yield","Duration","Rating_Score","DV01","Quantity"]].copy()
+
+    # ---- track the best feasible seen during search ----
+    best_feasible = {"obj": np.inf, "x": None}
+
+    # penalty weights (tune if needed)
+    W_BUDGET   = 1e6
+    W_RATING   = 5e5
+    W_DUR      = 1e5
+    W_YIELD    = 2e5
+    W_DV01     = 1e4
+    W_CONTRIB  = 5e5
+
+    def violation_penalty(port, total_mv, avg_rating, avg_yield, avg_dur, tot_dv01):
+        v = 0.0
+
+        # Budget (two-sided)
+        if total_mv < budget_low:
+            v += W_BUDGET * ((budget_low - total_mv) / max(1.0, current_total_mv))
+        if total_mv > budget_high:
+            v += W_BUDGET * ((total_mv - budget_high) / max(1.0, current_total_mv))
+
+        # Rating (must not worsen more than +0.2)
+        cap = base_avg_rating + 0.2
+        if np.isnan(avg_rating) or avg_rating > cap:
+            v += W_RATING * max(0.0, (avg_rating - cap))
+
+        # Duration (if requested: <= target+tol)
+        if "duration" in selected_params:
+            max_dur = targets["duration"] + tolerances["duration"]
+            if np.isnan(avg_dur) or avg_dur > max_dur:
+                v += W_DUR * max(0.0, avg_dur - max_dur)
+
+        # Yield (if requested: >= target - tol)
+        if "yield" in selected_params:
+            min_yld = targets["yield"] - tolerances["yield"]
+            if np.isnan(avg_yield) or avg_yield < min_yld:
+                v += W_YIELD * max(0.0, min_yld - avg_yield)
+
+        # DV01 (two-sided)
+        if "dv01" in selected_params:
+            slack = tolerances["dv01"]
+            miss = abs(tot_dv01 - targets["dv01"]) - slack
+            if miss > 0:
+                v += W_DV01 * miss
+
+        # Contribution cap (by MV share)
+        mv_series = (port["Price"] * port["Quantity"] / 100.0)
+        share_by_cusip = mv_series.groupby(port["CUSIP"]).sum() / max(1e-12, total_mv)
+        over = (share_by_cusip - (MAX_CONTRIB_PCT + CONTRIB_SLACK)).clip(lower=0.0)
+        if STRICT_CONTRIB_CAP and (over > 0).any():
+            # treat any breach as a heavy penalty (instead of instant reject)
+            v += W_CONTRIB * over.sum()
+        else:
+            # soft penalty
+            v += W_CONTRIB * over.sum()
+
+        return v
 
     def objective(x):
         cap_hits_total = 0
@@ -393,8 +479,11 @@ def build_objective(kept, slots, shortlists, selected_params, targets, tolerance
             # lot size & min qty
             q_orig = int(round(q_orig / lot_size)) * lot_size
             q_cand = int(round(q_cand / lot_size)) * lot_size
-            if q_orig != 0 and q_orig < min_qty: return INFEASIBLE
-            if q_cand != 0 and q_cand < min_qty: return INFEASIBLE
+            if q_orig != 0 and q_orig < min_qty:
+                # rather than instant reject, push with penalty via negative qty -> zero later
+                q_orig = 0
+            if q_cand != 0 and q_cand < min_qty:
+                q_cand = 0
 
             # cap hits (tie-break)
             if q_orig >= MAX_QTY: cap_hits_total += 1
@@ -419,60 +508,40 @@ def build_objective(kept, slots, shortlists, selected_params, targets, tolerance
                     chosen_cusips.append(c["CUSIP"])
                     swap_count += 1
 
-        # combine and budget guard
+        # combine portfolio
         port = pd.concat(built_rows, ignore_index=True)
-        total_mv = mv_of(port).sum()
-        if total_mv < budget_low or total_mv > budget_high:
-            return INFEASIBLE
 
         # drop zero qty
         port = port[port["Quantity"] > 0]
         if len(port) == 0:
-            return INFEASIBLE
+            return 1e12  # bad
 
-        # concentration cap (by MV share)
-        mv_series = (port["Price"] * port["Quantity"] / 100.0)
-        share_by_cusip = mv_series.groupby(port["CUSIP"]).sum() / max(1e-12, total_mv)
-        over = (share_by_cusip - (MAX_CONTRIB_PCT + CONTRIB_SLACK)).clip(lower=0.0)
-        if STRICT_CONTRIB_CAP and (over > 0).any():
-            return INFEASIBLE
-        contrib_penalty = over.sum() * CONTRIB_SOFT_WEIGHT
-
-        # rating guard
-        avg_rating = weighted_avg(port, "Quantity", "Rating_Score")
-        if np.isnan(avg_rating) or avg_rating > base_avg_rating + 0.2:
-            return INFEASIBLE
-
-        # portfolio stats
+        total_mv  = mv_of(port).sum()
         avg_yield = weighted_avg(port, "Quantity", "Yield")
         avg_dur   = weighted_avg(port, "Quantity", "Duration")
+        avg_rating= weighted_avg(port, "Quantity", "Rating_Score")
         tot_dv01  = (port["DV01"].fillna(0.0) * port["Quantity"]).sum()
 
-        # hard constraints
-        if "yield" in selected_params:
-            if avg_yield + 1e-12 < targets["yield"] - tolerances["yield"]:
-                return INFEASIBLE
-        if "duration" in selected_params:
-            if avg_dur - 1e-12 > targets["duration"] + tolerances["duration"]:
-                return INFEASIBLE
-        if "dv01" in selected_params:
-            if abs(tot_dv01 - targets["dv01"]) > tolerances["dv01"]:
-                return INFEASIBLE
+        # Penalty-first phase
+        pen = violation_penalty(port, total_mv, avg_rating, avg_yield, avg_dur, tot_dv01)
+        if pen > 0:
+            # Add gentle regularizers to guide search
+            obj = pen
+            obj += 1e-2 * (softcap_pen_units / max(1.0, SOFT_QTY_CAP))
+            obj += cap_hits_total * CAP_HIT_PENALTY
+            return obj
 
-        # no duplicate candidate CUSIPs
-        if len(chosen_cusips) != len(set(chosen_cusips)):
-            return DUPLICATE_CUSIP_PENALTY
-
-        # objective (minimize)
-        obj = -avg_yield if not np.isnan(avg_yield) else 0.0
-        if "duration" in selected_params and not np.isnan(avg_dur):
-            obj += 0.05 * avg_dur  # gentle nudge toward shorter subject to constraint
-
-        # penalties & rewards (single application)
+        # Feasible: update best tracker
+        nonlocal best_feasible
+        # true objective: maximize yield, minimize tiny regs
+        obj = -avg_yield
+        obj += 0.05 * (avg_dur if not np.isnan(avg_dur) else 0.0)
         obj += SOFT_PENALTY_WEIGHT * (softcap_pen_units / max(1.0, SOFT_QTY_CAP))
-        obj += contrib_penalty
         obj -= SWAP_REWARD * swap_count
         obj += cap_hits_total * CAP_HIT_PENALTY
+
+        if obj < best_feasible["obj"]:
+            best_feasible = {"obj": obj, "x": x.copy()}
 
         return obj
 
@@ -484,28 +553,71 @@ def build_objective(kept, slots, shortlists, selected_params, targets, tolerance
         bounds.append((0, MAX_QTY))   # original qty
         bounds.append((0, MAX_QTY))   # candidate qty
 
-    return objective, bounds, current_total_mv, base_avg_rating
+    return objective, bounds, current_total_mv, base_avg_rating, best_feasible
+
+
+
+def build_feasible_seed(kept, slots, shortlists, lot_size):
+    """
+    A simple guaranteed-feasible seed:
+      - keep 'kept' as-is
+      - keep each original slot at its current quantity (candidate off)
+      - selector=0, q_cand=0 for every slot
+    This matches baseline MV exactly → budget OK, rating OK, contrib usually OK.
+    """
+    x = []
+    for j, slot in enumerate(slots.itertuples(index=False)):
+        S_j = len(shortlists[j])
+        sel = 0
+        q_orig = int(round(slot.Quantity / lot_size)) * lot_size
+        q_cand = 0
+        x.extend([sel, q_orig, q_cand])
+    return np.array(x, dtype=float)
+
+def make_init_population(x0, bounds, popsize=25, jitter=0.10, seed=42):
+    """
+    Create a DE init population centered around x0 (feasible seed) with small jitter.
+    Shape: (M, dim), where M >= 5 recommended. We choose M = max(5, popsize*2).
+    """
+    rng = np.random.default_rng(seed)
+    dim = len(bounds)
+    M = max(5, popsize * 2)
+    pop = np.tile(x0, (M, 1))
+
+    lows = np.array([b[0] for b in bounds], dtype=float)
+    highs= np.array([b[1] for b in bounds], dtype=float)
+    span = np.maximum(1.0, highs - lows)
+
+    noise = rng.normal(loc=0.0, scale=jitter, size=(M, dim)) * span
+    pop = pop + noise
+
+    # clamp to bounds
+    pop = np.minimum(highs, np.maximum(lows, pop))
+    return pop
+
 
 
 # ---------- 5) Run optimization ----------
-def run_optimization(objective, bounds):
-    result = differential_evolution(
-        objective,
-        bounds,
+def run_optimization(objective, bounds, init_pop=None):
+    kwargs = dict(
         strategy='best1bin',
-        maxiter=400,
+        maxiter=500,
         popsize=25,
         tol=1e-6,
         polish=False,
         disp=False,
-        seed=42
+        seed=42,
+        updating='deferred',
+        init=init_pop if init_pop is not None else 'sobol',  # NEW
+        workers=1  # or -1 if you want parallel
     )
-    return result
+    return differential_evolution(objective, bounds, **kwargs)
+
 
 
 # ---------- 6) Reporting ----------
-def report(current, kept, slots, shortlists, result, lot_size, selected_params, targets, tolerances, budget_band):
-    x = result.x
+def report(current, kept, slots, shortlists, result, lot_size, selected_params, targets, tolerances, budget_band, x_override=None):
+    x = result.x if x_override is None else x_override
     rows = []
     cursor = 0
 
@@ -645,8 +757,27 @@ def report(current, kept, slots, shortlists, result, lot_size, selected_params, 
 
 # ---------- main ----------
 def main():
+    # Try to locate the CSV relative to this script and the CWD.
+    base_dir = Path(__file__).resolve().parent
+    candidates = [
+        base_dir / "ExchangeDataRequest_new(Corps).csv",
+        Path.cwd() / "ExchangeDataRequest_new(Corps).csv",
+        *base_dir.glob("ExchangeDataRequest*Corps*.csv"),
+        *Path.cwd().glob("ExchangeDataRequest*Corps*.csv"),
+        *base_dir.glob("ExchangeDataRequest*.csv"),  # broader fallbacks
+        *Path.cwd().glob("ExchangeDataRequest*.csv"),
+    ]
+    data_path = next((p for p in candidates if p.exists()), None)
+    if data_path is None:
+        print("[error] Could not find the universe CSV. Looked in:")
+        for p in {str(p.parent) for p in candidates}:
+            print("  -", p)
+        print("Tip: pass the exact path or put the file next to rebalance.py.")
+        return
+
     # 1) data
-    current, ext = load_data("ExchangeDataRequest_new(Corps).csv")
+    current, ext = load_data(str(data_path))
+    print(f"\n[diag] Using universe file: {data_path}")
     print("\n[diag] Cleaned-universe top yields:")
     print(ext.sort_values("Yield", ascending=False)[["CUSIP","Yield","Rating_Score"]].head(10).to_string(index=False))
     print("[diag] Max surviving yield:", ext["Yield"].max())
@@ -695,7 +826,7 @@ def main():
               int(((ext["Yield"] >= y_floor) & (ext["Rating_Score"] <= rating_cap)).sum()))
 
     # 4) objective + bounds
-    objective, bounds, _, _ = build_objective(
+    objective, bounds, _, _, best_tracker = build_objective(
         kept, slots, shortlists, selected_params, targets, tolerances, min_qty, lot_size, budget_band
     )
 
@@ -703,11 +834,19 @@ def main():
         print("\nNothing to rebalance: all bonds are frozen.")
         return
 
+    # 4.5) Build feasible seed & init population
+    seed_x = build_feasible_seed(kept, slots, shortlists, lot_size)
+    init_pop = make_init_population(seed_x, bounds, popsize=25, jitter=0.10, seed=42)
+
     # 5) optimize
-    result = run_optimization(objective, bounds)
+    result = run_optimization(objective, bounds, init_pop=init_pop)
+
+    # 5.5) Choose the best feasible vector for reporting
+    x_for_report = best_tracker["x"] if best_tracker["x"] is not None else result.x
 
     # 6) report
-    report(current, kept, slots, shortlists, result, lot_size, selected_params, targets, tolerances, budget_band)
+    # Slight tweak: allow report to take an override vector
+    report(current, kept, slots, shortlists, result, lot_size, selected_params, targets, tolerances, budget_band, x_override=x_for_report)
 
 
 if __name__ == "__main__":
